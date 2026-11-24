@@ -1824,9 +1824,14 @@ TERMINAL_EXES = {
 
 def proc_exe(pid: int) -> str:
     try:
-        return Path(os.readlink(f"/proc/{pid}/exe")).name
+        target = os.readlink(f"/proc/{pid}/exe")
     except OSError:
         return ""
+    # A binary replaced by a package upgrade while it runs reads back as
+    # "/usr/lib/app/app (deleted)". The program is still the same one.
+    if target.endswith(" (deleted)"):
+        target = target[:-len(" (deleted)")]
+    return Path(target).name
 
 
 def is_terminal_window(c: dict, argv: list[str]) -> bool:
@@ -1900,24 +1905,144 @@ def terminal_spec(c: dict, argv: list[str]) -> dict:
     return spec
 
 
+# A Chromium-family web app (`--app=URL`) names its window after the URL:
+# chrome-<host>_<path, / as _>-<profile>: https://app.hey.com/ becomes
+# chrome-app.hey.com__-Default. omarchy-webapp-window-class builds the same.
+WEBAPP_CLASS_RE = re.compile(
+    r"^(?:chrome|chromium|brave|msedge|vivaldi)-"
+    r"(?P<host>[A-Za-z0-9.-]+\.[A-Za-z0-9-]+)_(?P<path>_[^\s]*)-(?P<profile>[^-\s]+)$"
+)
+
+# Browser binaries whose command line may carry another window's `--app=`:
+# the first window a browser process opens decides its argv for every later
+# window, so a plain browser window can sit in a process started as a web app.
+CHROMIUM_EXES = {
+    "chromium", "chrome", "google-chrome", "google-chrome-stable",
+    "google-chrome-unstable", "brave", "brave-browser", "msedge",
+    "microsoft-edge", "vivaldi", "vivaldi-bin", "helium",
+}
+
+DESKTOP_FIELD_CODE_RE = re.compile(r"^%[fFuUdDnNickvm]$")
+MAX_DESKTOP_ENTRY_BYTES = 64 * 1024
+
+
+def webapp_url(cls: str) -> str:
+    """The URL a web-app window class stands for, or "" for any other class."""
+    m = WEBAPP_CLASS_RE.match(cls or "")
+    if not m:
+        return ""
+    return "https://" + m.group("host").lower() + m.group("path").replace("_", "/")
+
+
+def application_dirs() -> list[Path]:
+    """Desktop-entry folders in XDG order: the user's first, so theirs win."""
+    data_home = os.environ.get("XDG_DATA_HOME") or str(HOME / ".local/share")
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    return [Path(d) / "applications" for d in [data_home, *data_dirs.split(":")] if d]
+
+
+def read_desktop_entry(path: Path) -> dict[str, str]:
+    """The keys of a .desktop file's main [Desktop Entry] group."""
+    try:
+        if path.stat().st_size > MAX_DESKTOP_ENTRY_BYTES:
+            return {}
+        text = path.read_text(errors="replace")
+    except OSError:
+        return {}
+    fields: dict[str, str] = {}
+    group = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            group = line
+            continue
+        if group == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            fields.setdefault(key.strip(), value.strip())
+    return fields
+
+
+def desktop_exec(value: str) -> str:
+    """An Exec line as a command: field codes dropped, %% unescaped."""
+    try:
+        argv = shlex.split(value)
+    except ValueError:
+        return ""
+    argv = [a.replace("%%", "%") for a in argv if not DESKTOP_FIELD_CODE_RE.match(a)]
+    return shlex.join(argv) if argv else ""
+
+
+def desktop_command_for_class(cls: str) -> str:
+    """The launcher command of the desktop entry that names this window class."""
+    want = (cls or "").casefold()
+    if not want:
+        return ""
+    seen: set[str] = set()
+    for folder in application_dirs():
+        try:
+            entries = sorted(folder.glob("*.desktop"))
+        except OSError:
+            continue
+        for path in entries:
+            if path.name in seen:  # an entry in an earlier folder shadows it
+                continue
+            seen.add(path.name)
+            fields = read_desktop_entry(path)
+            if fields.get("Hidden", "").lower() == "true":
+                continue
+            if fields.get("StartupWMClass", "").casefold() != want:
+                continue
+            command = desktop_exec(fields.get("Exec", ""))
+            if command:
+                return command
+    return ""
+
+
+def split_process_title(argv: list[str], pid: int) -> list[str]:
+    """Undo a process title that packs the whole command line into argv[0].
+
+    Chromium and Electron apps rewrite their title so /proc/<pid>/cmdline
+    holds "path --flag ..." as one string. Split it back when its first word
+    is the running program, or at least an executable file.
+    """
+    if len(argv) != 1 or not any(ch.isspace() for ch in argv[0]):
+        return argv
+    try:
+        candidate = shlex.split(argv[0])
+    except ValueError:
+        return argv
+    if not candidate:
+        return argv
+    program = candidate[0]
+    if Path(program).name == proc_exe(pid):
+        return candidate
+    if os.path.isabs(program) and os.path.isfile(program) and os.access(program, os.X_OK):
+        return candidate
+    return argv
+
+
 def window_to_spec(c: dict) -> dict:
     pid = int(c.get("pid") or 0)
+    cls = c.get("class") or ""
     argv = proc_cmdline(pid) if pid > 1 else []
     if is_terminal_window(c, argv):
         return terminal_spec(c, argv)
+    url = webapp_url(cls)
+    if url:
+        # A web app shares its browser's process, so that process's command
+        # line describes the browser, not this window. Reopen the URL: through
+        # the launcher that names this class when there is one (it may also
+        # handle mailto: and the like), else through Omarchy's web-app helper.
+        return {"app": desktop_command_for_class(cls)
+                or shlex.join(["omarchy-launch-webapp", url]), "class": cls}
     if argv:
-        # Chromium rewrites its process title so /proc/<pid>/cmdline exposes
-        # the complete command line as argv[0]. Split that representation
-        # back into arguments before shlex.join() serializes it.
-        if len(argv) == 1 and any(ch.isspace() for ch in argv[0]):
-            try:
-                candidate = shlex.split(argv[0])
-            except ValueError:
-                candidate = []
-            if candidate and Path(candidate[0]).name == proc_exe(pid):
-                argv = candidate
-        return {"app": shlex.join(argv), "class": c.get("class") or ""}
-    return {"app": c.get("class") or "", "class": c.get("class") or ""}
+        argv = split_process_title(argv, pid)
+        if Path(argv[0]).name in CHROMIUM_EXES or proc_exe(pid) in CHROMIUM_EXES:
+            # This window is a plain browser window (web apps return above);
+            # an inherited --app= would reopen it as somebody else's web app.
+            argv = [argv[0]] + [a for a in argv[1:] if not a.startswith("--app=")]
+        return {"app": shlex.join(argv), "class": cls}
+    return {"app": cls, "class": cls}
 
 
 def nice_weights(sizes: list[int]) -> list[int]:
