@@ -229,7 +229,9 @@ floating and then tiles them into the split tree they were captured in, with
 each split at its captured ratio. Widths, heights, rows inside columns and
 arrangements that are not plain columns all come back as they were, and the
 order apps finish opening in does not matter. Ratios are relative, so the same
-arrangement fits a screen of another size.
+arrangement fits a screen of another size. A workspace keeps all its columns on
+a screen at least three quarters as wide as the one it was captured on, rather
+than folding them for the column limit.
 
 Columns and weights still describe the workspace: they draw the menu preview,
 and Tableau falls back to them for a workspace without `rect`s, a screen too

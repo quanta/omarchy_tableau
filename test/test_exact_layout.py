@@ -209,4 +209,17 @@ with tempfile.TemporaryDirectory() as tmp:
     uneven = cli.nice_weights([1000, 1731])
     assert uneven != [1, 1] and abs(uneven[0] / sum(uneven) - 1000 / 2731) < 0.06, uneven
 
+    # -- a captured screen's columns are not folded on a screen about as wide
+    wide = [{"name": "DP-1", "description": "", "focused": True, "width": 5120,
+             "height": 1440, "scale": 1, "transform": 0}]
+    narrow = [{**wide[0], "width": 1920, "height": 1080}]
+    six = {"number": 1, "screen": [5120, 1440], "columns": [{"windows": []}] * 6}
+    plain = {"number": 2, "columns": [{"windows": []}] * 6}
+    setup = {"name": "Wide", "workspaces": [six, plain]}
+    with patch.object(cli, "load_monitor_blocks", lambda: {}):
+        on_wide = cli.resolve_plan(setup, wide, None)["workspaces"]
+        on_narrow = cli.resolve_plan(setup, narrow, None)["workspaces"]
+    assert [w["columns"] for w in on_wide] == [6, 4], on_wide
+    assert [w["columns"] for w in on_narrow] == [3, 3], on_narrow
+
 print("exact layout checks passed")
