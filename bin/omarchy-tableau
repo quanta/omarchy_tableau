@@ -503,6 +503,8 @@ def load_config() -> dict:
                 raise ConfigError(f"{s['name']}: too many columns")
             if "monitor" in w:
                 bounded_string(w["monitor"], f"{s['name']}: monitor", MAX_MONITOR_CHARS)
+            if "screen" in w and valid_box(w["screen"], 2) is None:
+                raise ConfigError(f"{s['name']}: `screen` must be [width, height] in pixels")
             for c in columns:
                 if not isinstance(c, dict):
                     raise ConfigError(f"{s['name']}: every column must be a table")
@@ -531,6 +533,8 @@ def load_config() -> dict:
                         bounded_string(win["dir"], f"{s['name']}: window dir", MAX_PATH_CHARS)
                     if "class" in win:
                         bounded_string(win["class"], f"{s['name']}: window class", MAX_NAME_CHARS)
+                    if "rect" in win and valid_box(win["rect"], 4) is None:
+                        raise ConfigError(f"{s['name']}: window `rect` must be [x, y, width, height] in pixels")
                     total_windows += 1
                     if "wait" in win:
                         try:
@@ -604,6 +608,30 @@ def load_config() -> dict:
             raise ConfigError(f"option `{key}` must be true or false")
     data["setups"] = setups
     return data
+
+
+MAX_PIXELS = 100000
+
+
+def valid_box(value, length: int) -> list[float] | None:
+    """A `rect` ([x, y, w, h]) or `screen` ([w, h]) as numbers, or None.
+
+    Sizes, the last two numbers, must be positive. Positions may be negative
+    but stay bounded like everything else read from the file.
+    """
+    if not isinstance(value, list) or len(value) != length:
+        return None
+    out = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        number = float(item)
+        if not math.isfinite(number) or abs(number) > MAX_PIXELS:
+            return None
+        out.append(number)
+    if out[-1] <= 0 or out[-2] <= 0:
+        return None
+    return out
 
 
 def find_setup(cfg: dict, name: str) -> dict | None:
@@ -1087,6 +1115,157 @@ def wait_for_window(before: set[str], timeout: float, want_class: str = "") -> d
 # building a workspace
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# exact layout: rebuild a captured dwindle tree from its window rectangles
+# --------------------------------------------------------------------------
+
+SPLIT_SLACK = 2       # px of overlap still read as "side by side" (rounding)
+MIN_SPLIT = 0.05      # a split this close to an edge is not a real split
+
+
+def split_tree(items: list[tuple], bounds: list[float]) -> dict | None:
+    """Recover a dwindle tree from the rectangles of its windows.
+
+    `items` are (key, x, y, w, h). Dwindle splits every area in two, so a
+    tiled workspace is a guillotine partition: some straight cut always
+    separates its windows into two groups, and each group again. The cut sits
+    in the middle of the gap between the groups, and its ratio is relative to
+    the area being cut, so the tree fits any screen it is rebuilt on.
+    Returns None when the rectangles are not such a partition (overlapping
+    or grouped windows): the caller then falls back to columns.
+    """
+    if not items:
+        return None
+    if len(items) == 1:
+        return {"leaf": items[0][0]}
+    best = None
+    for axis in (0, 1):
+        start_of = lambda it: it[1 + axis]
+        end_of = lambda it: it[1 + axis] + it[3 + axis]
+        ordered = sorted(items, key=start_of)
+        for i in range(1, len(ordered)):
+            before, after = ordered[:i], ordered[i:]
+            edge = max(end_of(it) for it in before)
+            start = min(start_of(it) for it in after)
+            if start < edge - SPLIT_SLACK:
+                continue
+            cut = (edge + start) / 2
+            fraction = (cut - bounds[axis]) / bounds[2 + axis]
+            if not MIN_SPLIT < fraction < 1 - MIN_SPLIT:
+                continue
+            # Prefer the cut nearest the middle: any valid cut reproduces the
+            # same rectangles, and balanced trees keep ratios well in range.
+            score = (abs(0.5 - fraction), axis)
+            if best is None or score < best[0]:
+                best = (score, axis, cut, fraction, before, after)
+    if best is None:
+        return None
+    _, axis, cut, fraction, before, after = best
+    first, second = list(bounds), list(bounds)
+    first[2 + axis] = cut - bounds[axis]
+    second[axis] = cut
+    second[2 + axis] = bounds[axis] + bounds[2 + axis] - cut
+    a, b = split_tree(before, first), split_tree(after, second)
+    if a is None or b is None:
+        return None
+    # Dwindle's split ratio is 0.1-1.9, with 1.0 an even split.
+    return {"axis": axis, "ratio": round(min(1.9, max(0.1, 2 * fraction)), 6),
+            "first": a, "second": b}
+
+
+def first_leaf(tree: dict):
+    return tree["leaf"] if "leaf" in tree else first_leaf(tree["first"])
+
+
+def exact_tree(ws_cfg: dict, columns: list[dict]) -> dict | None:
+    """The captured tree of a workspace, when its windows can be placed exactly.
+
+    Every tiled window needs a `rect`, and the columns must not have been
+    folded for a narrower screen: a fold changes the arrangement on purpose.
+    Keys are (column, window) positions in `columns`.
+    """
+    declared = ws_cfg.get("columns") or []
+    if len(columns) != len(declared):
+        return None
+    items = []
+    for ci, col in enumerate(columns):
+        for wi, win in enumerate(col.get("windows") or []):
+            if win.get("float"):
+                continue
+            rect = valid_box(win.get("rect"), 4)
+            if rect is None:
+                return None
+            items.append(((ci, wi), *rect))
+    if len(items) < 2:
+        return None
+    x0 = min(it[1] for it in items)
+    y0 = min(it[2] for it in items)
+    x1 = max(it[1] + it[3] for it in items)
+    y1 = max(it[2] + it[4] for it in items)
+    return split_tree(items, [x0, y0, x1 - x0, y1 - y0])
+
+
+def set_floating(address: str, on: bool) -> None:
+    dispatch(f'hl.dsp.window.float({{ action = "{"on" if on else "off"}", '
+             f'window = "address:{address}" }})')
+
+
+def dwindle_bool(name: str) -> bool | None:
+    option = hypr_json("getoption", f"dwindle:{name}")
+    if isinstance(option, dict) and "bool" in option:
+        return bool(option["bool"])
+    return None
+
+
+def place_tree(tree: dict, addresses: dict) -> None:
+    """Tile floating windows into the tree, splitting from the root down.
+
+    Each split takes the window that already holds the whole area (the first
+    leaf of its first half) and preselects a split beside or below it; the
+    first leaf of the second half then tiles into that slot, and the ratio is
+    set on the split the two now share.
+    """
+    if "leaf" in tree:
+        return
+    anchor = safe_window_address(addresses.get(first_leaf(tree["first"])))
+    newcomer = safe_window_address(addresses.get(first_leaf(tree["second"])))
+    if anchor and newcomer:
+        dispatch(f'hl.dsp.focus({{ window = "address:{anchor}" }})')
+        dispatch(f'hl.dsp.layout("preselect {"r" if tree["axis"] == 0 else "d"}")')
+        set_floating(newcomer, False)
+        time.sleep(0.1)
+        dispatch(f'hl.dsp.focus({{ window = "address:{newcomer}" }})')
+        dispatch(f'hl.dsp.layout("splitratio {tree["ratio"]} exact")')
+    place_tree(tree["first"], addresses)
+    place_tree(tree["second"], addresses)
+
+
+def rebuild_tree(tree: dict, addresses: dict) -> None:
+    """Tile the workspace's floating windows into `tree`.
+
+    Splits must follow the focused window and stay put once made; set the
+    two dwindle options that guarantee that for the rebuild only.
+    """
+    changed = {}
+    for name in ("preserve_split", "use_active_for_splits"):
+        value = dwindle_bool(name)
+        if value is False:
+            changed[name] = value
+    if changed:
+        hypr_eval("hl.config({ dwindle = { "
+                  + ", ".join(f"{name} = true" for name in changed) + " } })")
+    try:
+        root = safe_window_address(addresses.get(first_leaf(tree)))
+        if root:
+            set_floating(root, False)
+            time.sleep(0.1)
+        place_tree(tree, addresses)
+    finally:
+        if changed:
+            hypr_eval("hl.config({ dwindle = { "
+                      + ", ".join(f"{name} = false" for name in changed) + " } })")
+
+
 def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str]:
     number = int(ws_plan["number"])
     monitor = ws_plan.get("monitor") or ""
@@ -1102,9 +1281,23 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
     # is not a choice to override, so the splits still run and the rule
     # does not stamp layout = "dwindle".
     tile = mode in ("", "dwindle")
+    # A captured workspace carries each window's rectangle. Then every window
+    # opens floating, out of the way of the next, and is tiled into the
+    # captured tree afterwards -- the order apps finish opening in no longer
+    # shapes the layout, and no size is rounded to a column weight.
+    tree = exact_tree(ws_cfg, columns) if tile else None
+    addresses: dict = {}            # (column, window) -> address, exact path
 
     placed: list[list[dict]] = []   # [column][window] -> client
     problems: list[str] = []
+
+    def release_floats() -> None:
+        # Abandoning the exact path must not leave a pile of floating
+        # windows: tile whatever opened, in the order it was asked for.
+        for key in sorted(addresses):
+            address = safe_window_address(addresses[key])
+            if address:
+                set_floating(address, False)
 
     for ci, col in enumerate(columns):
         wins = list(col.get("windows") or [])
@@ -1112,7 +1305,9 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
             continue
         col_clients: list[dict] = []
         for wi, win in enumerate(wins):
-            if tile and wi == 0 and ci > 0 and placed:
+            if tree is not None:
+                pass  # placed by rebuild_tree once everything is open
+            elif tile and wi == 0 and ci > 0 and placed:
                 anchor = placed[-1][0]
                 address = safe_window_address(anchor.get("address"))
                 if not address:
@@ -1143,6 +1338,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 # window's anchor below and take the whole load with it.
                 problems.append(f"{label} never opened")
                 log(f"timeout waiting for {label}")
+                release_floats()
                 return problems
             if client["workspace"]["id"] != number:
                 address = safe_window_address(client.get("address"))
@@ -1152,6 +1348,16 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 dispatch(f'hl.dsp.window.move({{ window = "address:{address}", '
                          f'workspace = "{number}", follow = false }})')
                 time.sleep(0.15)
+            if tree is not None and not win.get("float"):
+                # Park it floating until rebuild_tree tiles it into place.
+                address = safe_window_address(client.get("address"))
+                if address:
+                    addresses[(ci, wi)] = address
+                    if not client.get("floating"):
+                        set_floating(address, True)
+                        time.sleep(0.1)
+                col_clients.append(client)
+                continue
             if should_unfloat(client, win, mode):
                 # Some window rule floats this class -- Omarchy does it for
                 # TUIs, 1Password, media players. In a setup that leaves a
@@ -1172,7 +1378,9 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
         if col_clients:
             placed.append(col_clients)
 
-    if placed and tile:
+    if tree is not None:
+        rebuild_tree(tree, addresses)
+    elif placed and tile:
         apply_sizes(number, columns, placed)
     return problems
 
@@ -1924,8 +2132,9 @@ def nice_weights(sizes: list[int]) -> list[int]:
     """Turn measured pixel sizes into the small whole numbers a human wrote.
 
     A 2/3 + 1/3 split should read back as `width = 2` and `width = 1`, not as
-    1255 and 627. Anything that does not land close to a simple ratio falls
-    back to equal weights, which is the honest answer for a messy desk.
+    1255 and 627. Anything that does not land close to a simple ratio keeps
+    its proportions as percentages: equal weights would silently resize a
+    desk the moment it is loaded on a screen that folds it into columns.
     """
     total = sum(sizes) or 1
     fractions = [s / total for s in sizes]
@@ -1936,7 +2145,7 @@ def nice_weights(sizes: list[int]) -> list[int]:
         got = [c / sum(cand) for c in cand]
         if all(abs(g - f) < 0.06 for g, f in zip(got, fractions)):
             return cand
-    return [1] * len(sizes)
+    return [max(1, round(f * 100)) for f in fractions]
 
 
 def capture_window(c: dict) -> bool:
@@ -1972,8 +2181,13 @@ def snapshot() -> list[dict]:
         by_ws.setdefault(wid, []).append(c)
 
     blocks = load_monitor_blocks()
+    screens = {str(m.get("name") or ""): m for m in (hypr_json("monitors") or [])
+               if isinstance(m, dict)}
     workspaces = []
     for wid in sorted(by_ws):
+        monitor = monitor_of_workspace(wid)
+        screen = screens.get(monitor)
+        origin = (int(screen.get("x", 0)), int(screen.get("y", 0))) if screen else None
         wins = sorted(by_ws[wid], key=lambda c: (c["at"][0], c["at"][1]))
         columns: list[list[dict]] = []
         for c in wins:
@@ -2008,12 +2222,18 @@ def snapshot() -> list[dict]:
                     spec.pop("float", None)
                 if hw != 1 or len(col) > 1:
                     spec["height"] = hw
+                if origin is not None:
+                    # Where the window is, relative to its screen, so a load
+                    # can rebuild the arrangement exactly (see exact_tree).
+                    spec["rect"] = [int(c["at"][0]) - origin[0], int(c["at"][1]) - origin[1],
+                                    int(c["size"][0]), int(c["size"][1])]
                 out_wins.append(spec)
             out_cols.append({"width": cw, "windows": out_wins})
-        monitor = monitor_of_workspace(wid)
         entry = {"number": capture_workspace_number(wid, monitor, blocks), "columns": out_cols}
         if monitor:
             entry["monitor"] = monitor
+        if screen:
+            entry["screen"] = list(logical_size(screen))
         workspaces.append(entry)
     return workspaces
 
@@ -2045,6 +2265,8 @@ def render_setup(name: str, workspaces: list[dict], services: list, icon: str = 
         monitor = str(ws.get("monitor") or "").strip()
         if monitor:
             lines.append(f"  monitor = {json.dumps(monitor)}")
+        if ws.get("screen"):
+            lines.append(f"  screen = {toml_inline(ws['screen'])}")
         lines.append("  columns = [")
         for col in ws["columns"]:
             lines.append(f"    {toml_inline(col)},")

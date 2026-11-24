@@ -117,6 +117,7 @@ services = []
 | `width` | Relative width of a column. |
 | `float` | Keep this window floating. A window that is floating only because its workspace layout is floating is not saved this way. |
 | `wait` | Seconds to wait for the window. Default: 20. |
+| `rect` | Written by capture: the window's `[x, y, width, height]` on its screen, in logical pixels. See [Exact layout](#exact-layout). |
 
 Use the default Omarchy helpers when possible:
 
@@ -207,6 +208,33 @@ close, Tableau pauses and asks what to do.
 If a load is interrupted by a crash or shell restart, Tableau marks it as
 recoverable and offers **Restore** and **Start clean** in the menu. It never
 silently replaces the current desktop.
+
+### Exact layout
+
+**Capture Current Desktop** also records where each window was: a `rect` on
+every window and the workspace's `screen` size.
+
+```toml
+  [[setups.workspaces]]
+  number = 1
+  screen = [5120, 1440]
+  columns = [
+    { width = 2, windows = [{ term = "", rect = [12, 38, 1264, 1390] }] },
+    { width = 1, windows = [{ app = "nautilus", class = "org.gnome.Nautilus", rect = [1290, 38, 3818, 1390] }] },
+  ]
+```
+
+When every tiled window of a workspace has a `rect`, Tableau opens the windows
+floating and then tiles them into the split tree they were captured in, with
+each split at its captured ratio. Widths, heights, rows inside columns and
+arrangements that are not plain columns all come back as they were, and the
+order apps finish opening in does not matter. Ratios are relative, so the same
+arrangement fits a screen of another size.
+
+Columns and weights still describe the workspace: they draw the menu preview,
+and Tableau falls back to them for a workspace without `rect`s, a screen too
+narrow for its columns, or a scrolling or floating workspace. Delete the
+`rect`s to hand-tune a captured workspace with weights again.
 
 ## CLI
 
