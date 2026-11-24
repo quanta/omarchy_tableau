@@ -1008,12 +1008,18 @@ def resolve_plan(setup: dict, mons: list[dict], remembered: dict | None) -> dict
             mon_name = ""
         width = logical_size(mon)[0] if mon else 1920
         declared = len(ws.get("columns") or []) or 1
+        cap = max_columns(width)
+        captured = valid_box(ws.get("screen"), 2)
+        if captured and width >= 0.75 * captured[0]:
+            # Captured on a screen about this wide: its columns already fit,
+            # and folding them would throw away the exact layout.
+            cap = declared
         plan_ws.append({
             "index": i,
             "number": hypr_id,
             "slot": config_number if 1 <= config_number <= WORKSPACE_SLOTS else workspace_slot(hypr_id),
             "monitor": mon_name,
-            "columns": max(1, min(declared, max_columns(width))),
+            "columns": max(1, min(declared, cap)),
         })
     return {"version": LAYOUT_PLAN_VERSION, "workspaces": plan_ws, "saved": time.time()}
 
