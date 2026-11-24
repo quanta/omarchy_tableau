@@ -2135,10 +2135,30 @@ def is_terminal_window(c: dict, argv: list[str]) -> bool:
     # would save it as a shell. The captive portal is a browser window.
     if is_non_terminal_class(cls):
         return False
-    exe = proc_exe(int(c.get("pid") or 0))
+    pid = int(c.get("pid") or 0)
+    exe = proc_exe(pid)
     argv0 = Path(argv[0]).name if argv else ""
-    return (exe in TERMINAL_EXES or argv0 in TERMINAL_EXES
-            or cls in TERMINAL_CLASSES or cls.startswith("org.omarchy."))
+    if exe in TERMINAL_EXES or argv0 in TERMINAL_EXES or cls in TERMINAL_CLASSES:
+        return True
+    if cls.startswith("org.omarchy."):
+        # Omarchy names TUI windows org.omarchy.<tool>, and a terminal this
+        # list does not know can carry that class too. Other apps use the
+        # prefix as well (Qt and GTK tools, the about window's own apps), so
+        # take the prefix as "terminal" only when the program cannot be told
+        # apart: its executable is unknown, or it runs something on a pty.
+        return pid <= 1 or not exe or has_pty_child(pid)
+    return False
+
+
+def has_pty_child(pid: int) -> bool:
+    """Whether a process has a child on a pseudo-terminal, as a terminal does."""
+    for child in child_pids(pid):
+        try:
+            if os.readlink(f"/proc/{child}/fd/0").startswith("/dev/pts/"):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def terminal_spec(c: dict, argv: list[str]) -> dict:
