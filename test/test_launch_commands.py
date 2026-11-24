@@ -98,6 +98,29 @@ with tempfile.TemporaryDirectory() as tmp:
         spec = cli.window_to_spec({"pid": 42, "class": "app.example"})
         assert shlex.split(spec["app"]) == [str(app), "--ozone-platform=wayland"], (exe, spec)
 
+    # -- org.omarchy.* is a terminal only when it behaves like one ----------
+    qt_app = {"pid": 42, "class": "org.omarchy.messages"}
+    cli.proc_cmdline = lambda pid: ["/opt/messages-qml"]
+    cli.child_pids = lambda pid: []
+    cli.proc_exe = lambda pid: "messages-qml"
+    assert cli.is_terminal_window(qt_app, ["/opt/messages-qml"]) is False
+    assert cli.window_to_spec(qt_app)["app"].endswith("messages-qml")
+    cli.proc_exe = lambda pid: ""      # unknown program: keep the old guess
+    assert cli.is_terminal_window(qt_app, []) is True
+    cli.proc_exe = lambda pid: "rio"   # a terminal the list does not know
+    cli.child_pids = lambda pid: [43]
+    real_readlink = cli.os.readlink
+    try:
+        cli.os.readlink = lambda path: "/dev/pts/7" if path == "/proc/43/fd/0" else real_readlink(path)
+        assert cli.is_terminal_window({"pid": 42, "class": "org.omarchy.btop"}, ["rio"]) is True
+        cli.os.readlink = lambda path: "/dev/null" if path == "/proc/43/fd/0" else real_readlink(path)
+        assert cli.is_terminal_window({"pid": 42, "class": "org.omarchy.btop"}, ["rio"]) is False
+    finally:
+        cli.os.readlink = real_readlink
+    cli.child_pids = lambda pid: []
+    cli.proc_exe = lambda pid: "kitty"  # a known terminal is one whatever its class
+    assert cli.is_terminal_window({"pid": 42, "class": "org.omarchy.btop"}, ["kitty"]) is True
+
     # A title that is not a program path stays one argument.
     cli.proc_cmdline = lambda pid: ["worker: idle queue"]
     cli.proc_exe = lambda pid: "python3"
