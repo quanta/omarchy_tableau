@@ -236,6 +236,30 @@ and Tableau falls back to them for a workspace without `rect`s, a screen too
 narrow for its columns, or a scrolling or floating workspace. Delete the
 `rect`s to hand-tune a captured workspace with weights again.
 
+### Floating windows
+
+Capture leaves floating windows out by default. To keep them, set:
+
+```toml
+[options]
+capture_floating = true
+```
+
+Capture then writes each floating window to its workspace's `floating` list,
+with its `rect`:
+
+```toml
+  floating = [
+    { app = "gnome-calculator", class = "org.gnome.Calculator", rect = [3000, 200, 420, 560] },
+  ]
+```
+
+A load opens them after the tiled windows, floating, at their captured position
+and size, scaled to the screen when it differs from `screen`. A floating window
+that never opens is reported without stopping the rest of the workspace.
+Omarchy's About window and screensaver, and pinned windows, are never captured.
+In a floating workspace, every window goes back to its captured `rect`.
+
 ## CLI
 
 ```bash

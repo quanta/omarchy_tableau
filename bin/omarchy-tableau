@@ -443,6 +443,38 @@ def safe_window_address(value) -> str | None:
     return address if WINDOW_ADDRESS_RE.fullmatch(address) else None
 
 
+def check_window(s: dict, win) -> None:
+    """Validate one window table of setup `s`, in a column or `floating`."""
+    if not isinstance(win, dict):
+        raise ConfigError(f"{s['name']}: every window must be a table")
+    if "term" not in win and "app" not in win:
+        raise ConfigError(f"{s['name']}: a window needs `term` or `app`")
+    if "term" in win and not isinstance(win["term"], str):
+        raise ConfigError(f"{s['name']}: window `term` must be a string")
+    if "app" in win and not isinstance(win["app"], str):
+        raise ConfigError(f"{s['name']}: window `app` must be a string")
+    if "term" in win:
+        parse_command(win["term"], f"{s['name']}: window term", allow_empty=True)
+    if "app" in win:
+        parse_command(win["app"], f"{s['name']}: window app")
+    for key in ("dir", "class"):
+        if key in win and not isinstance(win[key], str):
+            raise ConfigError(f"{s['name']}: window `{key}` must be a string")
+    if "dir" in win:
+        bounded_string(win["dir"], f"{s['name']}: window dir", MAX_PATH_CHARS)
+    if "class" in win:
+        bounded_string(win["class"], f"{s['name']}: window class", MAX_NAME_CHARS)
+    if "rect" in win and valid_box(win["rect"], 4) is None:
+        raise ConfigError(f"{s['name']}: window `rect` must be [x, y, width, height] in pixels")
+    if "wait" in win:
+        try:
+            wait = float(win["wait"])
+        except (TypeError, ValueError):
+            raise ConfigError(f"{s['name']}: window `wait` must be a finite number")
+        if not math.isfinite(wait) or wait <= 0 or wait > 3600:
+            raise ConfigError(f"{s['name']}: window `wait` must be between 0 and 3600 seconds")
+
+
 def load_config() -> dict:
     text = read_user_file(CONFIG_PATH, MAX_CONFIG_BYTES)
     if text is None:
@@ -505,6 +537,14 @@ def load_config() -> dict:
                 bounded_string(w["monitor"], f"{s['name']}: monitor", MAX_MONITOR_CHARS)
             if "screen" in w and valid_box(w["screen"], 2) is None:
                 raise ConfigError(f"{s['name']}: `screen` must be [width, height] in pixels")
+            floats = w.get("floating") or []
+            if not isinstance(floats, list):
+                raise ConfigError(f"{s['name']}: floating must be a list of windows")
+            if len(floats) > MAX_WINDOWS:
+                raise ConfigError(f"{s['name']}: too many floating windows")
+            for win in floats:
+                check_window(s, win)
+                total_windows += 1
             for c in columns:
                 if not isinstance(c, dict):
                     raise ConfigError(f"{s['name']}: every column must be a table")
@@ -514,35 +554,8 @@ def load_config() -> dict:
                 if len(windows) > MAX_WINDOWS:
                     raise ConfigError(f"{s['name']}: too many windows in a column")
                 for win in windows:
-                    if not isinstance(win, dict):
-                        raise ConfigError(f"{s['name']}: every window must be a table")
-                    if "term" not in win and "app" not in win:
-                        raise ConfigError(f"{s['name']}: a window needs `term` or `app`")
-                    if "term" in win and not isinstance(win["term"], str):
-                        raise ConfigError(f"{s['name']}: window `term` must be a string")
-                    if "app" in win and not isinstance(win["app"], str):
-                        raise ConfigError(f"{s['name']}: window `app` must be a string")
-                    if "term" in win:
-                        parse_command(win["term"], f"{s['name']}: window term", allow_empty=True)
-                    if "app" in win:
-                        parse_command(win["app"], f"{s['name']}: window app")
-                    for key in ("dir", "class"):
-                        if key in win and not isinstance(win[key], str):
-                            raise ConfigError(f"{s['name']}: window `{key}` must be a string")
-                    if "dir" in win:
-                        bounded_string(win["dir"], f"{s['name']}: window dir", MAX_PATH_CHARS)
-                    if "class" in win:
-                        bounded_string(win["class"], f"{s['name']}: window class", MAX_NAME_CHARS)
-                    if "rect" in win and valid_box(win["rect"], 4) is None:
-                        raise ConfigError(f"{s['name']}: window `rect` must be [x, y, width, height] in pixels")
+                    check_window(s, win)
                     total_windows += 1
-                    if "wait" in win:
-                        try:
-                            wait = float(win["wait"])
-                        except (TypeError, ValueError):
-                            raise ConfigError(f"{s['name']}: window `wait` must be a finite number")
-                        if not math.isfinite(wait) or wait <= 0 or wait > 3600:
-                            raise ConfigError(f"{s['name']}: window `wait` must be between 0 and 3600 seconds")
                     for key in ("width", "height"):
                         if key in win or key in c:
                             value = win.get(key) if key in win else c.get(key)
@@ -603,7 +616,7 @@ def load_config() -> dict:
                 raise ConfigError(f"option `{key}` must be a finite number")
             if not math.isfinite(value) or value <= 0 or value > 3600:
                 raise ConfigError(f"option `{key}` must be between 0 and 3600 seconds")
-    for key in ("restore_last", "save_on_switch"):
+    for key in ("restore_last", "save_on_switch", "capture_floating"):
         if key in data["options"] and not isinstance(data["options"][key], bool):
             raise ConfigError(f"option `{key}` must be true or false")
     data["setups"] = setups
@@ -1289,6 +1302,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
     addresses: dict = {}            # (column, window) -> address, exact path
 
     placed: list[list[dict]] = []   # [column][window] -> client
+    opened: list[tuple[dict, dict]] = []   # (window spec, client), in order
     problems: list[str] = []
 
     def release_floats() -> None:
@@ -1357,6 +1371,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                         set_floating(address, True)
                         time.sleep(0.1)
                 col_clients.append(client)
+                opened.append((win, client))
                 continue
             if should_unfloat(client, win, mode):
                 # Some window rule floats this class -- Omarchy does it for
@@ -1375,6 +1390,7 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
                 client = next((c for c in clients()
                                if c["address"] == client["address"]), client)
             col_clients.append(client)
+            opened.append((win, client))
         if col_clients:
             placed.append(col_clients)
 
@@ -1382,7 +1398,77 @@ def build_workspace(ws_cfg: dict, ws_plan: dict, opts: dict, report) -> list[str
         rebuild_tree(tree, addresses)
     elif placed and tile:
         apply_sizes(number, columns, placed)
+
+    floats = list(ws_cfg.get("floating") or [])
+    if not floats and mode != "floating":
+        return problems
+    screen = workspace_screen(number)
+    saved_screen = valid_box(ws_cfg.get("screen"), 2)
+    if mode == "floating":
+        # The floating mode floated every window; put each where it was.
+        for win, client in opened:
+            address = safe_window_address(client.get("address"))
+            if address:
+                place_floating(address, win.get("rect"), saved_screen, screen)
+    for win in floats:
+        # Captured floating windows (`capture_floating`) open last, above
+        # the tiled desk, at their captured place. One that never opens is
+        # reported but does not cost the workspace its other windows.
+        label = str(win.get("term") or win.get("app") or "terminal").split()[0]
+        report(f"workspace {ws_plan.get('slot') or number}: {label}")
+        before = {c["address"] for c in clients()}
+        spawn_window(win)
+        wait = float(win.get("wait") or opts.get("window_wait") or DEFAULT_WINDOW_WAIT)
+        client = wait_for_window(before, wait, str(win.get("class") or ""))
+        if client is None:
+            problems.append(f"{label} never opened")
+            log(f"timeout waiting for {label}")
+            continue
+        address = safe_window_address(client.get("address"))
+        if not address:
+            problems.append("invalid Hyprland window address")
+            continue
+        if (client.get("workspace") or {}).get("id") != number:
+            dispatch(f'hl.dsp.window.move({{ window = "address:{address}", '
+                     f'workspace = "{number}", follow = false }})')
+            time.sleep(0.15)
+        if not client.get("floating"):
+            set_floating(address, True)
+            time.sleep(0.1)
+        place_floating(address, win.get("rect"), saved_screen, screen)
     return problems
+
+
+def workspace_screen(number: int) -> dict | None:
+    """The monitor a workspace is on now, as Hyprland reports it."""
+    name = monitor_of_workspace(number)
+    for mon in hypr_json("monitors") or []:
+        if isinstance(mon, dict) and name and mon.get("name") == name:
+            return mon
+    return None
+
+
+def place_floating(address: str, rect, saved_screen: list[float] | None,
+                   screen: dict | None) -> None:
+    """Size and move a floating window to its captured rectangle.
+
+    The rectangle is relative to the screen it was captured on. On a screen
+    of another size it scales with it, so a window in the right third stays
+    in the right third.
+    """
+    box = valid_box(rect, 4)
+    if box is None or not screen:
+        return
+    width, height = logical_size(screen)
+    sx = width / saved_screen[0] if saved_screen else 1.0
+    sy = height / saved_screen[1] if saved_screen else 1.0
+    x = int(screen.get("x", 0)) + round(box[0] * sx)
+    y = int(screen.get("y", 0)) + round(box[1] * sy)
+    w, h = max(60, round(box[2] * sx)), max(60, round(box[3] * sy))
+    dispatch(f'hl.dsp.window.resize({{ window = "address:{address}", '
+             f'x = {w}, y = {h}, relative = false }})')
+    dispatch(f'hl.dsp.window.move({{ window = "address:{address}", '
+             f'x = {x}, y = {y}, relative = false }})')
 
 
 def apply_sizes(number: int, columns: list[dict], placed: list[list[dict]]) -> None:
@@ -2148,12 +2234,19 @@ def nice_weights(sizes: list[int]) -> list[int]:
     return [max(1, round(f * 100)) for f in fractions]
 
 
-def capture_window(c: dict) -> bool:
+def user_floating(c: dict) -> bool:
+    """Floating by its own choice or an app rule, not by the workspace mode."""
+    return bool(c.get("floating")) and not mode_floated_window(c)
+
+
+def capture_window(c: dict, *, floating: bool = False) -> bool:
     """Whether a client belongs in a captured desk.
 
-    Windows floating on their own stay out, as before. Windows the floating
-    workspace mode floated are the desk itself: they are captured with the
-    tiled windows and are not recorded as `float = true`.
+    Windows floating on their own stay out unless `floating` asks for them
+    (the `capture_floating` option); Omarchy's About window and screensaver
+    and pinned windows, which follow every workspace, stay out regardless.
+    Windows the floating workspace mode floated are the desk itself: they
+    are captured with the tiled windows and are not recorded as floating.
     """
     if not c.get("mapped", True):
         return False
@@ -2166,29 +2259,41 @@ def capture_window(c: dict) -> bool:
         return False
     if is_non_terminal_class(c.get("class") or ""):
         return False
-    if c.get("floating") and not mode_floated_window(c):
-        return False
+    if user_floating(c):
+        if not floating or c.get("pinned"):
+            return False
+        cls = c.get("class") or ""
+        return not any(rule.search(cls) for rule in OMARCHY_DEDICATED_FLOAT_RES)
     return True
 
 
-def snapshot() -> list[dict]:
+def snapshot(capture_floating: bool = False) -> list[dict]:
     """Read the current desktop back as workspace/column/window structure."""
     by_ws: dict[int, list[dict]] = {}
+    floats_by_ws: dict[int, list[dict]] = {}
     for c in clients():
-        if not capture_window(c):
+        if not capture_window(c, floating=capture_floating):
             continue
         wid = int(c["workspace"]["id"])
-        by_ws.setdefault(wid, []).append(c)
+        target = floats_by_ws if user_floating(c) else by_ws
+        target.setdefault(wid, []).append(c)
 
     blocks = load_monitor_blocks()
     screens = {str(m.get("name") or ""): m for m in (hypr_json("monitors") or [])
                if isinstance(m, dict)}
     workspaces = []
-    for wid in sorted(by_ws):
+    for wid in sorted(set(by_ws) | set(floats_by_ws)):
         monitor = monitor_of_workspace(wid)
         screen = screens.get(monitor)
         origin = (int(screen.get("x", 0)), int(screen.get("y", 0))) if screen else None
-        wins = sorted(by_ws[wid], key=lambda c: (c["at"][0], c["at"][1]))
+
+        def rect_of(c: dict) -> list[int]:
+            # Where the window is, relative to its screen, so a load can put
+            # it back exactly (see exact_tree and place_floating).
+            return [int(c["at"][0]) - origin[0], int(c["at"][1]) - origin[1],
+                    int(c["size"][0]), int(c["size"][1])]
+
+        wins = sorted(by_ws.get(wid, []), key=lambda c: (c["at"][0], c["at"][1]))
         columns: list[list[dict]] = []
         for c in wins:
             placed = False
@@ -2223,10 +2328,7 @@ def snapshot() -> list[dict]:
                 if hw != 1 or len(col) > 1:
                     spec["height"] = hw
                 if origin is not None:
-                    # Where the window is, relative to its screen, so a load
-                    # can rebuild the arrangement exactly (see exact_tree).
-                    spec["rect"] = [int(c["at"][0]) - origin[0], int(c["at"][1]) - origin[1],
-                                    int(c["size"][0]), int(c["size"][1])]
+                    spec["rect"] = rect_of(c)
                 out_wins.append(spec)
             out_cols.append({"width": cw, "windows": out_wins})
         entry = {"number": capture_workspace_number(wid, monitor, blocks), "columns": out_cols}
@@ -2234,6 +2336,16 @@ def snapshot() -> list[dict]:
             entry["monitor"] = monitor
         if screen:
             entry["screen"] = list(logical_size(screen))
+        floats = []
+        for c in sorted(floats_by_ws.get(wid, []), key=lambda c: (c["at"][0], c["at"][1])):
+            spec = window_to_spec(c)
+            spec.pop("opacity", None)
+            spec.pop("float", None)  # the list says so
+            if origin is not None:
+                spec["rect"] = rect_of(c)
+            floats.append(spec)
+        if floats:
+            entry["floating"] = floats
         workspaces.append(entry)
     return workspaces
 
@@ -2271,6 +2383,11 @@ def render_setup(name: str, workspaces: list[dict], services: list, icon: str = 
         for col in ws["columns"]:
             lines.append(f"    {toml_inline(col)},")
         lines.append("  ]")
+        if ws.get("floating"):
+            lines.append("  floating = [")
+            for win in ws["floating"]:
+                lines.append(f"    {toml_inline(win)},")
+            lines.append("  ]")
     return "\n".join(lines) + "\n"
 
 
@@ -2408,7 +2525,11 @@ def store_snapshot(name: str, cfg: dict, *, create: bool) -> tuple[str, int]:
     existing = find_setup(cfg, name)
     if existing is None and not create:
         return "missing", 0
-    workspaces = snapshot()
+    options = cfg.get("options") or {}
+    if options.get("capture_floating") is True:
+        workspaces = snapshot(capture_floating=True)
+    else:
+        workspaces = snapshot()
     if not workspaces:
         return "empty", 0
     canonical = (existing or {}).get("name") or name
@@ -2439,7 +2560,7 @@ def store_snapshot(name: str, cfg: dict, *, create: bool) -> tuple[str, int]:
             "number": hypr_id,
             "slot": int(ws["number"]) if 1 <= int(ws["number"]) <= WORKSPACE_SLOTS else workspace_slot(hypr_id),
             "monitor": mon,
-            "columns": len(ws["columns"]),
+            "columns": max(1, len(ws["columns"])),  # a workspace may hold only floats
         })
     remember_plan(canonical, fp, {
         "version": LAYOUT_PLAN_VERSION,
@@ -2529,6 +2650,7 @@ def setup_shape(setup: dict) -> tuple[list, int]:
                 "h": [weight_of(w.get("height")) for w in wins],
                 "labels": [window_label(w) for w in wins],
             })
+        windows += len(ws.get("floating") or [])
         shape.append({"number": ws.get("number"), "columns": cols})
     return shape, windows
 
